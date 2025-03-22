@@ -1,0 +1,221 @@
+---
+- name: Установить PostgreSQL и fail2ban
+  apt:
+    name:
+      - postgresql
+      - postgresql-contrib
+      - fail2ban
+    state: present
+    update_cache: yes
+  tags: [postgres, packages]
+
+- name: Настроить PostgreSQL
+  block:
+    - name: Настроить listen_addresses
+      lineinfile:
+        path: /etc/postgresql/{{ postgres_version }}/main/postgresql.conf
+        regexp: '^listen_addresses ='
+        line: "listen_addresses = '*'"
+        backup: yes
+
+    - name: Оставить peer аутентификацию для postgres
+      lineinfile:
+        path: /etc/postgresql/{{ postgres_version }}/main/pg_hba.conf
+        regexp: '^local\s+all\s+postgres\s+'
+        line: 'local   all             postgres                                peer'
+        backup: yes
+
+    - name: Настроить аутентификацию для всех
+      lineinfile:
+        path: /etc/postgresql/{{ postgres_version }}/main/pg_hba.conf
+        regexp: '^local\s+all\s+all\s+'
+        line: 'local   all             all                                     md5'
+        backup: yes
+
+    - name: Разрешить доступ с сервера Б
+      lineinfile:
+        path: /etc/postgresql/{{ postgres_version }}/main/pg_hba.conf
+        line: "host    all             all             {{ hostvars['hostB.renue']['ansible_host'] }}/32 md5"
+  notify: Restart PostgreSQL
+  tags: [postgres, config]
+
+- name: Создать базы данных
+  community.postgresql.postgresql_db:
+    name: "{{ item.db }}"
+    state: present
+  loop: "{{ postgres_users | selectattr('db', 'defined') }}"
+  become_user: postgres
+  tags: [postgres, db]
+
+- name: Создать пользователей
+  community.postgresql.postgresql_user:
+    name: "{{ item.name }}"
+    password: "{{ item.password }}"
+    encrypted: yes
+    state: present
+  loop: "{{ postgres_users }}"
+  become_user: postgres
+  tags: [postgres, users]
+
+- name: Настроить права для app
+  community.postgresql.postgresql_privs:
+    database: app
+    roles: app
+    type: database
+    privs: ALL
+  become_user: postgres
+  tags: [postgres, privileges]
+
+- name: Настроить права для custom
+  community.postgresql.postgresql_privs:
+    database: custom
+    roles: custom
+    type: database
+    privs: ALL
+  become_user: postgres
+  tags: [postgres, privileges]
+
+- name: Настроить права для service (CONNECT)
+  community.postgresql.postgresql_privs:
+    database: "{{ item }}"
+    roles: service
+    type: database
+    privs: CONNECT
+    state: present
+  loop:
+    - app
+    - custom
+  become_user: postgres
+  tags: [postgres, privileges]
+
+- name: Отозвать CREATE на схеме public у PUBLIC
+  community.postgresql.postgresql_privs:
+    database: "{{ item }}"
+    roles: PUBLIC
+    type: schema
+    obj: public
+    privs: CREATE
+    state: absent
+  loop:
+    - app
+    - custom
+  become_user: postgres
+  tags: [postgres, privileges]
+
+- name: Предоставить USAGE на схеме public пользователю service
+  community.postgresql.postgresql_privs:
+    database: "{{ item }}"
+    roles: service
+    type: schema
+    obj: public
+    privs: USAGE
+    state: present
+  loop:
+    - app
+    - custom
+  become_user: postgres
+  tags: [postgres, privileges]
+
+- name: Настроить права по умолчанию на SELECT для service на новые таблицы
+  community.postgresql.postgresql_privs:
+    database: "{{ item }}"
+    roles: service
+    type: default_privs
+    privs: SELECT
+    objs: TABLES
+    schema: public
+    state: present
+  loop:
+    - app
+    - custom
+  become_user: postgres
+  tags: [postgres, privileges]
+
+- name: Настроить fail2ban
+  copy:
+    dest: /etc/fail2ban/jail.local
+    content: |
+      [sshd]
+      enabled = true
+      maxretry = 3
+      findtime = 60
+      bantime = 3600
+  notify: Restart fail2ban
+  tags: [fail2ban]
+
+- name: Настроить бэкапы
+  block:
+    - name: Создать директорию бэкапов
+      file:
+        path: /backups
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0750'
+
+    - name: Добавить пользователя devops в группу postgres
+      user:
+        name: devops
+        groups: postgres
+        append: yes
+
+    - name: Развернуть скрипт бэкапа
+      copy:
+        dest: /usr/local/bin/pg_backup.sh
+        mode: '0750'
+        owner: postgres
+        group: postgres
+        content: |
+          #!/bin/bash
+          TIMESTAMP=$(date +%F)
+          pg_dump -Fc app > /backups/app_${TIMESTAMP}.dump
+          pg_dump -Fc custom > /backups/custom_${TIMESTAMP}.dump
+          rsync -avz -e "ssh -i /var/lib/postgresql/.ssh/id_rsa -o StrictHostKeyChecking=no" \
+            /backups/ devops@{{ hostvars['hostB.renue']['ansible_host'] }}:/backups/
+
+    - name: Настроить SSH ключи
+      block:
+        - name: Создать .ssh директорию
+          file:
+            path: /var/lib/postgresql/.ssh
+            state: directory
+            owner: postgres
+            group: postgres
+            mode: '0700'
+
+        - name: Сгенерировать ключи
+          command: ssh-keygen -t rsa -b 4096 -f /var/lib/postgresql/.ssh/id_rsa -q -N ""
+          args:
+            creates: /var/lib/postgresql/.ssh/id_rsa
+          become_user: postgres
+
+        - name: Получить публичный ключ
+          fetch:
+            src: /var/lib/postgresql/.ssh/id_rsa.pub
+            dest: /tmp/postgres_pubkey
+            flat: yes
+
+        - name: Добавить ключ на сервер Б
+          authorized_key:
+            user: devops
+            key: "{{ lookup('file', '/tmp/postgres_pubkey') }}"
+            state: present
+          delegate_to: hostB.renue
+          become: yes
+
+    - name: Настроить cron
+      cron:
+        name: "PostgreSQL Backup"
+        job: "/usr/local/bin/pg_backup.sh"
+        user: postgres
+        minute: "0"
+        hour: "2"
+  tags: [backup]
+
+- name: Настроить фаервол
+  ufw:
+    rule: allow
+    port: 5432
+    proto: tcp
+    src: "{{ hostvars['hostB.renue']['ansible_host'] }}"
+  tags: [firewall]

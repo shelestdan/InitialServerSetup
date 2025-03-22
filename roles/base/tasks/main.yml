@@ -1,0 +1,94 @@
+---
+- name: Установить базовые пакеты
+  apt:
+    name:
+      - python3-pip
+      - acl
+      - sudo
+      - postgresql-client
+      - python3-psycopg2
+      - ufw
+    state: present
+    update_cache: yes
+  tags: [base, packages]
+
+- name: Создать пользователя devops
+  user:
+    name: devops
+    state: present
+    shell: /bin/bash
+    groups: sudo
+    append: yes
+    home: /home/devops
+    create_home: yes
+  tags: [base, users]
+
+- name: Настроить SSH доступ для devops
+  block:
+    - name: Создать .ssh директорию
+      file:
+        path: /home/devops/.ssh
+        state: directory
+        owner: devops
+        group: devops
+        mode: '0700'
+
+    - name: Добавить публичный ключ
+      authorized_key:
+        user: devops
+        state: present
+        key: "{{ ssh_pub_key }}"
+  tags: [base, ssh]
+
+- name: Настроить sudo без пароля
+  copy:
+    dest: /etc/sudoers.d/99-devops-nopasswd
+    content: "devops ALL=(ALL) NOPASSWD:ALL"
+    mode: '0440'
+    validate: 'visudo -cf %s'
+  tags: [base, sudo]
+
+- name: Настроить SSH аутентификацию
+  block:
+    - name: Отключить парольную аутентификацию
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+        backup: yes
+
+    - name: Включить аутентификацию по ключу
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PubkeyAuthentication'
+        line: 'PubkeyAuthentication yes'
+        backup: yes
+  notify: Restart SSH
+  tags: [base, ssh]
+
+- name: Настроить фаервол
+  block:
+    - name: Включить UFW
+      ufw:
+        state: enabled
+        policy: deny
+        direction: incoming
+
+    - name: Разрешить SSH
+      ufw:
+        rule: allow
+        port: 22
+        proto: tcp
+  tags: [base, firewall]
+
+- name: Проверить статус SSH
+  shell: systemctl is-active ssh
+  register: ssh_status
+  changed_when: false
+  tags: [verification]
+
+- name: Убедиться в работе SSH
+  assert:
+    that: "'active' in ssh_status.stdout"
+    fail_msg: "SSH не работает!"
+  tags: [verification]

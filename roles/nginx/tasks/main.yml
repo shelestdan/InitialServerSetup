@@ -1,0 +1,39 @@
+---
+- name: Установить nginx
+  apt:
+    name: nginx
+    state: present
+    update_cache: yes
+  tags: [nginx]
+
+- name: Настроить nginx
+  template:
+    src: templates/nginx.conf.j2
+    dest: /etc/nginx/sites-available/default
+  notify: Restart nginx
+  tags: [nginx]
+
+- name: Создать директорию бэкапов
+  file:
+    path: /backups
+    state: directory
+    owner: devops
+    group: devops
+    mode: '0755'
+  tags: [backup]
+
+- name: Настроить фаервол
+  block:
+    - name: Запретить доступ к nginx
+      ufw:
+        rule: deny
+        proto: tcp
+        port: 80,443
+        src: "{{ hostvars['hostA.renue']['ansible_host'] }}"
+
+    - name: Разрешить HTTP/HTTPS
+      ufw:
+        rule: allow
+        proto: tcp
+        port: 80,443
+  tags: [firewall]
